@@ -2,7 +2,7 @@ FROM tbusaspatial/trekker:v1.4.11
 
 WORKDIR /opt
 
-ARG TREKKER_REPO=https://github.com/klarman-cell-observatory/trekker.git
+ARG TREKKER_REPO=https://github.com/klarman-cell-observatory/trekker-terra.git
 ARG TREKKER_BRANCH=main
 
 # Install system dependencies and Google Cloud CLI
