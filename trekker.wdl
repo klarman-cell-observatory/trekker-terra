@@ -1,11 +1,12 @@
 version 1.0
 
 workflow trekker_sc {
-
     input {
         File input_samplesheet
         String output_directory
         String docker_registry
+        Boolean run_trekker_merge
+        Boolean existing_trekker_outs
 
         Int num_cpu = 16
         String memory = "256G"
@@ -14,18 +15,44 @@ workflow trekker_sc {
 
     Array[String] all_rows = read_lines(input_samplesheet)
 
-    scatter (row_index in range(length(all_rows) - 1)) {
+    if (!existing_trekker_outs) {
+        scatter (row_index in range(length(all_rows) - 1)) {
+            Int row_index_plus_one = row_index + 1
+            String sample_line = all_rows[row_index_plus_one]
 
-        Int row_index_plus_one = row_index + 1
+            call process_sample {
+                input:
+                    line = sample_line,
+                    input_samplesheet = input_samplesheet,
+                    output_directory = output_directory,
+                    docker_registry = docker_registry,
+                    num_cpu = num_cpu,
+                    memory = memory,
+                    disk_space = disk_space
+            }
+        }
 
-        String sample_line = all_rows[row_index_plus_one]
+        if (run_trekker_merge) {
+            call merge_after_run = merge_sample_groups {
+                input:
+                    input_samplesheet = input_samplesheet,
+                    output_directory = output_directory,
+                    docker_registry = docker_registry,
+                    run_outputs = flatten(select_all(process_sample.trekker_output_files)),
+                    num_cpu = num_cpu,
+                    memory = memory,
+                    disk_space = disk_space
+            }
+        }
+    }
 
-        call process_sample {
+    if (existing_trekker_outs && run_trekker_merge) {
+        call merge_existing = merge_sample_groups {
             input:
-                line = sample_line,
                 input_samplesheet = input_samplesheet,
                 output_directory = output_directory,
                 docker_registry = docker_registry,
+                run_outputs = [],
                 num_cpu = num_cpu,
                 memory = memory,
                 disk_space = disk_space
@@ -33,20 +60,18 @@ workflow trekker_sc {
     }
 
     output {
-        Array[File] trekker_outputs =
-            flatten(process_sample.trekker_output_files)
+        Array[File] trekker_outputs = if (existing_trekker_outs) then [] else flatten(select_all(process_sample.trekker_output_files))
+        File? merge_manifest = if (run_trekker_merge) then (if (existing_trekker_outs) then merge_existing.merge_manifest else merge_after_run.merge_manifest) else None
     }
 }
 
 
 task process_sample {
-
     input {
         String line
         File input_samplesheet
         String output_directory
         String docker_registry
-
         Int num_cpu
         String memory
         Int disk_space
@@ -58,415 +83,262 @@ task process_sample {
         MNT_PATH="/mnt/disks/cromwell_root"
         RAW_DIR="${MNT_PATH}/raw"
         OUT_DIR="${MNT_PATH}/out"
-
-        mkdir -p "${RAW_DIR}"
-        mkdir -p "${OUT_DIR}"
-
+        mkdir -p "${RAW_DIR}" "${OUT_DIR}"
         chmod -R 777 "${MNT_PATH}"
 
-        SAMPLE_NAME=$(echo "~{line}" | awk -F',' '{print $1}')
-        BARCODE_PATH=$(echo "~{line}" | awk -F',' '{print $4}')
-        FASTQR1_PATH=$(echo "~{line}" | awk -F',' '{print $5}')
-        FASTQR2_PATH=$(echo "~{line}" | awk -F',' '{print $6}')
-        SC_OUTDIR=$(echo "~{line}" | awk -F',' '{print $7}')
+        python3 - \
+            "~{input_samplesheet}" \
+            "~{line}" \
+            "${RAW_DIR}/sample_info.tsv" <<'PY'
+import csv, sys
+sheet, line, output = sys.argv[1:]
+with open(sheet, newline='') as f:
+    reader = csv.DictReader(f)
+    header = reader.fieldnames or []
+    if not header:
+        raise RuntimeError("Samplesheet is empty or has no header")
+# Parse the individual row using CSV quoting rules, then associate values with the header.
+parsed = next(csv.reader([line]))
+if len(parsed) != len(header):
+    raise RuntimeError(f"Samplesheet row has {len(parsed)} columns; expected {len(header)}")
+data = dict(zip(header, parsed))
+required = ["sample", "sample_group", "barcode_file", "fastq_1", "fastq_2", "sc_outdir"]
+missing = [k for k in required if k not in data]
+if missing:
+    raise RuntimeError("Samplesheet missing required columns: " + ", ".join(missing))
+with open(output, "w") as f:
+    for key in required:
+        f.write(f"{key}\t{data[key]}\n")
+PY
 
-        echo "============================================================"
-        echo "Processing sample: ${SAMPLE_NAME}"
-        echo "============================================================"
+        get_value() { awk -F '\t' -v key="$1" '$1 == key {sub(/^[^\t]*\t/, ""); print; exit}' "${RAW_DIR}/sample_info.tsv"; }
+        SAMPLE_NAME="$(get_value sample)"
+        SAMPLE_GROUP="$(get_value sample_group)"
+        BARCODE_PATH="$(get_value barcode_file)"
+        FASTQR1_PATH="$(get_value fastq_1)"
+        FASTQR2_PATH="$(get_value fastq_2)"
+        SC_OUTDIR="$(get_value sc_outdir)"
 
-        echo "Barcode/tile path: ${BARCODE_PATH}"
-        echo "FASTQ R1:          ${FASTQR1_PATH}"
-        echo "FASTQ R2:          ${FASTQR2_PATH}"
-        echo "sc_outdir:         ${SC_OUTDIR}"
-        echo "Output directory:  ~{output_directory}"
-        echo ""
+        if [[ -z "${SAMPLE_NAME}" || -z "${SAMPLE_GROUP}" ]]; then
+            echo "ERROR: sample and sample_group must both be populated in the samplesheet." >&2
+            exit 1
+        fi
 
-        echo "============================================================"
-        echo "Container diagnostics"
-        echo "============================================================"
+        echo "Processing sample: ${SAMPLE_NAME} (group: ${SAMPLE_GROUP})"
+        echo "R1: ${FASTQR1_PATH}"
+        echo "R2: ${FASTQR2_PATH}"
+        echo "Barcode: ${BARCODE_PATH}"
+        echo "sc_outdir: ${SC_OUTDIR}"
 
-        echo "PATH=${PATH}"
-
-        echo "gcloud location:"
-        which gcloud || true
-
-        echo "gcloud version:"
-        gcloud --version
-
-        echo ""
-
-        LOCAL_SAMPLE_SHEET="${RAW_DIR}/$(basename "~{input_samplesheet}")"
-        cp "~{input_samplesheet}" "${LOCAL_SAMPLE_SHEET}"
-
-        echo "Downloading FASTQ R1..."
-        gcloud storage cp \
-            "${FASTQR1_PATH}" \
-            "${RAW_DIR}/"
-
-        echo "Downloading FASTQ R2..."
-        gcloud storage cp \
-            "${FASTQR2_PATH}" \
-            "${RAW_DIR}/"
-
-        echo "Downloading barcode/tile file..."
-        gcloud storage cp \
-            "${BARCODE_PATH}" \
-            "${RAW_DIR}/"
-
+        # Localize the sample's inputs, following the nuclei_locater localization pattern.
+        gcloud storage cp "${FASTQR1_PATH}" "${RAW_DIR}/"
+        gcloud storage cp "${FASTQR2_PATH}" "${RAW_DIR}/"
+        gcloud storage cp "${BARCODE_PATH}" "${RAW_DIR}/"
         LOCAL_R1="${RAW_DIR}/$(basename "${FASTQR1_PATH}")"
         LOCAL_R2="${RAW_DIR}/$(basename "${FASTQR2_PATH}")"
         LOCAL_BARCODE="${RAW_DIR}/$(basename "${BARCODE_PATH}")"
 
-        echo ""
-        echo "Localized files:"
-        echo "  R1:      ${LOCAL_R1}"
-        echo "  R2:      ${LOCAL_R2}"
-        echo "  Barcode: ${LOCAL_BARCODE}"
-        echo ""
-
         if [[ "${SC_OUTDIR}" == *.h5 ]]; then
-
-            echo "CellBender H5 input detected."
-
-            echo "Downloading CellBender output..."
-
-            gcloud storage cp \
-                "${SC_OUTDIR}" \
-                "${RAW_DIR}/"
-
+            gcloud storage cp "${SC_OUTDIR}" "${RAW_DIR}/"
             LOCAL_CELLBENDER_H5="${RAW_DIR}/$(basename "${SC_OUTDIR}")"
-            CELLBENDER_MATRIX_DIR="${RAW_DIR}/cellbender_matrix"
-
-            echo ""
-            echo "CellBender H5:"
-            echo "  ${LOCAL_CELLBENDER_H5}"
-            echo ""
-
-            echo "Converting CellBender H5 to 10x Matrix Market..."
-
-            python3 \
-                /opt/trekker-v1.4.11/terra/cellbender_to_10x.py \
-                "${LOCAL_CELLBENDER_H5}" \
-                "${CELLBENDER_MATRIX_DIR}"
-
-            echo ""
-            echo "CellBender conversion complete."
-
-            ls -lh "${CELLBENDER_MATRIX_DIR}"
-
-            LOCAL_SC_OUTDIR="${CELLBENDER_MATRIX_DIR}"
-
+            LOCAL_SC_OUTDIR="${RAW_DIR}/cellbender_matrix"
+            python3 /opt/trekker-v1.4.11/terra/cellbender_to_10x.py \
+                "${LOCAL_CELLBENDER_H5}" "${LOCAL_SC_OUTDIR}"
         else
-
-            echo "Non-H5 sc_outdir detected."
-
-            echo "Downloading supplied sc_outdir..."
-
-            gcloud storage cp \
-                -r \
-                "${SC_OUTDIR}" \
-                "${RAW_DIR}/"
-
-            LOCAL_SC_OUTDIR="${RAW_DIR}/$(basename "${SC_OUTDIR}")"
-
+            LOCAL_SC_PARENT="${RAW_DIR}/sc_input"
+            mkdir -p "${LOCAL_SC_PARENT}"
+            gcloud storage cp -r "${SC_OUTDIR}" "${LOCAL_SC_PARENT}/"
+            LOCAL_SC_OUTDIR="${LOCAL_SC_PARENT}/$(basename "${SC_OUTDIR%/}")"
         fi
 
+        # Make a one-sample localized samplesheet and replace cloud paths with local paths.
         LOCAL_TREKKER_SAMPLESHEET="${RAW_DIR}/trekker_samplesheet.csv"
-
         python3 - \
-            "${LOCAL_SAMPLE_SHEET}" \
+            "~{input_samplesheet}" \
             "${LOCAL_TREKKER_SAMPLESHEET}" \
             "${SAMPLE_NAME}" \
             "${LOCAL_BARCODE}" \
             "${LOCAL_R1}" \
             "${LOCAL_R2}" \
-            "${LOCAL_SC_OUTDIR}" \
-            <<'PY'
-
-import csv
-import sys
-
-(
-    input_csv,
-    output_csv,
-    sample_name,
-    barcode_path,
-    fastq1_path,
-    fastq2_path,
-    sc_outdir,
-) = sys.argv[1:]
-
-with open(input_csv, "r", newline="") as infile:
-    reader = csv.reader(infile)
+            "${LOCAL_SC_OUTDIR}" <<'PY'
+import csv, sys
+source, destination, sample, barcode, r1, r2, sc_outdir = sys.argv[1:]
+with open(source, newline='') as f:
+    reader = csv.DictReader(f)
+    if not reader.fieldnames:
+        raise RuntimeError("Samplesheet has no header")
+    header = reader.fieldnames
+    required = ["sample", "barcode_file", "fastq_1", "fastq_2", "sc_outdir"]
+    missing = [c for c in required if c not in header]
+    if missing:
+        raise RuntimeError("Samplesheet missing required columns: " + ", ".join(missing))
     rows = list(reader)
-
-if not rows:
-    raise RuntimeError("Samplesheet is empty.")
-
-header = rows[0]
-
-header_lookup = {
-    name.strip(): index
-    for index, name in enumerate(header)
-}
-
-required_columns = [
-    "sample",
-    "barcode_file",
-    "fastq_1",
-    "fastq_2",
-    "sc_outdir",
-]
-
-missing = [
-    column
-    for column in required_columns
-    if column not in header_lookup
-]
-
-if missing:
-    raise RuntimeError(
-        "Samplesheet is missing required columns: "
-        + ", ".join(missing)
-    )
-
-sample_idx = header_lookup["sample"]
-barcode_idx = header_lookup["barcode_file"]
-fastq1_idx = header_lookup["fastq_1"]
-fastq2_idx = header_lookup["fastq_2"]
-sc_outdir_idx = header_lookup["sc_outdir"]
-
-updated_rows = [header]
-found_sample = False
-
-for row in rows[1:]:
-
-    if not row:
-        continue
-
-    if len(row) < len(header):
-        raise RuntimeError(
-            f"Malformed samplesheet row with {len(row)} columns; "
-            f"expected at least {len(header)}."
-        )
-
-    if row[sample_idx] == sample_name:
-
-        row[barcode_idx] = barcode_path
-        row[fastq1_idx] = fastq1_path
-        row[fastq2_idx] = fastq2_path
-        row[sc_outdir_idx] = sc_outdir
-
-        updated_rows.append(row)
-        found_sample = True
-        break
-
-if not found_sample:
-    raise RuntimeError(
-        f"Could not find sample '{sample_name}' in samplesheet."
-    )
-
-with open(output_csv, "w", newline="") as outfile:
-    writer = csv.writer(outfile)
-    writer.writerows(updated_rows)
-
-print(
-    f"Wrote localized samplesheet: {output_csv}"
-)
-
+matched = [r for r in rows if r.get("sample") == sample]
+if len(matched) != 1:
+    raise RuntimeError(f"Expected exactly one row for sample {sample}; found {len(matched)}")
+row = matched[0]
+row["barcode_file"] = barcode
+row["fastq_1"] = r1
+row["fastq_2"] = r2
+row["sc_outdir"] = sc_outdir
+with open(destination, "w", newline='') as f:
+    writer = csv.DictWriter(f, fieldnames=header)
+    writer.writeheader()
+    writer.writerow(row)
+print(f"Wrote localized samplesheet: {destination}")
 PY
 
-        echo ""
-        echo "============================================================"
-        echo "Localized Trekker samplesheet"
-        echo "============================================================"
-
         cat "${LOCAL_TREKKER_SAMPLESHEET}"
+        bash /opt/trekker-v1.4.11/nuclei_locater_toplevel.sh "${LOCAL_TREKKER_SAMPLESHEET}"
 
-        echo ""
-
-        echo "============================================================"
-        echo "Starting Trekker"
-        echo "============================================================"
-
-        set +e
-
-        bash \
-            /opt/trekker-v1.4.11/nuclei_locater_toplevel.sh \
-            "${LOCAL_TREKKER_SAMPLESHEET}"
-
-        TREKKER_EXIT=$?
-
-        set -e
-
-        echo ""
-        echo "============================================================"
-        echo "Trekker process exited"
-        echo "============================================================"
-
-        echo "Trekker exit code: ${TREKKER_EXIT}"
-
+        # Preserve Trekker's analysis log alongside the sample output.
         ANALYSIS_LOG="${RAW_DIR}/log/${SAMPLE_NAME}/analysis.log"
-        LOCAL_ANALYSIS_LOG="${OUT_DIR}/${SAMPLE_NAME}_analysis.log"
-
-        echo ""
-        echo "============================================================"
-        echo "Preserving Trekker analysis log"
-        echo "============================================================"
-
-        echo "Expected analysis log:"
-        echo "  ${ANALYSIS_LOG}"
-
         if [[ -f "${ANALYSIS_LOG}" ]]; then
-
-            echo "Analysis log found."
-
-            cp \
-                "${ANALYSIS_LOG}" \
-                "${LOCAL_ANALYSIS_LOG}"
-
-            echo "Copied analysis log to:"
-            echo "  ${LOCAL_ANALYSIS_LOG}"
-
-            DESTINATION="~{output_directory}"
-            DESTINATION="${DESTINATION%/}"
-
-            ANALYSIS_LOG_DESTINATION="${DESTINATION}/${SAMPLE_NAME}/${SAMPLE_NAME}_analysis.log"
-
-            echo ""
-            echo "Uploading analysis log to:"
-            echo "  ${ANALYSIS_LOG_DESTINATION}"
-
-            gcloud storage cp \
-                "${LOCAL_ANALYSIS_LOG}" \
-                "${ANALYSIS_LOG_DESTINATION}"
-
-            echo ""
-            echo "Analysis log upload complete."
-
-        else
-
-            echo "WARNING: Trekker analysis.log was not found."
-
-            echo "Contents of raw/log:"
-            if [[ -d "${RAW_DIR}/log" ]]; then
-                find \
-                    "${RAW_DIR}/log" \
-                    -maxdepth 4 \
-                    -print
-            else
-                echo "No ${RAW_DIR}/log directory exists."
-            fi
-
+            cp "${ANALYSIS_LOG}" "${OUT_DIR}/${SAMPLE_NAME}_analysis.log"
         fi
 
-        echo ""
-
-        if [[ "${TREKKER_EXIT}" -ne 0 ]]; then
-
-            echo "============================================================"
-            echo "Trekker failed"
-            echo "============================================================"
-
-            echo "Trekker exit code: ${TREKKER_EXIT}"
-
-            if [[ -f "${LOCAL_ANALYSIS_LOG}" ]]; then
-                echo ""
-                echo "The Trekker analysis log was successfully preserved at:"
-                echo "  ${LOCAL_ANALYSIS_LOG}"
-            fi
-
-            exit "${TREKKER_EXIT}"
-
-        fi
-
-        echo ""
-        echo "============================================================"
-        echo "Trekker complete"
-        echo "============================================================"
-
-        echo "Trekker output directory:"
-        echo "  ${OUT_DIR}"
-        echo ""
-
-        echo "Trekker output files:"
-
-        find \
-            "${OUT_DIR}" \
-            -type f \
-            -print
-
-        echo ""
-
-        OUTPUT_FILE_COUNT=$(find \
-            "${OUT_DIR}" \
-            -type f \
-            | wc -l)
-
-        echo "Trekker output file count: ${OUTPUT_FILE_COUNT}"
-
+        OUTPUT_FILE_COUNT="$(find "${OUT_DIR}" -type f | wc -l)"
         if [[ "${OUTPUT_FILE_COUNT}" -eq 0 ]]; then
-            echo ""
-            echo "ERROR: Trekker completed but produced no output files."
-            echo ""
-            echo "Contents of output directory:"
-            find \
-                "${OUT_DIR}" \
-                -print
+            echo "ERROR: Trekker produced no files for ${SAMPLE_NAME}." >&2
             exit 1
         fi
 
-        echo ""
-        echo "Trekker produced ${OUTPUT_FILE_COUNT} output file(s)."
-        echo ""
-
         DESTINATION="~{output_directory}"
-        DESTINATION="${DESTINATION%/}"
-
-        SAMPLE_DESTINATION="${DESTINATION}/${SAMPLE_NAME}"
-
-        echo "============================================================"
-        echo "Uploading Trekker outputs"
-        echo "============================================================"
-
-        echo "Destination:"
-        echo "  ${SAMPLE_DESTINATION}"
-        echo ""
-
+        DESTINATION="${DESTINATION%/}/${SAMPLE_NAME}/outputs"
         while IFS= read -r FILE; do
-
             RELATIVE_PATH="${FILE#${OUT_DIR}/}"
+            gcloud storage cp "${FILE}" "${DESTINATION}/${RELATIVE_PATH}"
+        done < <(find "${OUT_DIR}" -type f -print)
 
-            DESTINATION_FILE="${SAMPLE_DESTINATION}/${RELATIVE_PATH}"
-
-            echo "Uploading:"
-            echo "  ${FILE}"
-            echo "To:"
-            echo "  ${DESTINATION_FILE}"
-            echo ""
-
-            gcloud storage cp \
-                "${FILE}" \
-                "${DESTINATION_FILE}"
-
-        done < <(
-            find \
-                "${OUT_DIR}" \
-                -type f \
-                -print
-        )
-
-        echo ""
-        echo "============================================================"
-        echo "Trekker output upload complete"
-        echo "============================================================"
-
+        echo "Uploaded ${OUTPUT_FILE_COUNT} output files to ${DESTINATION}"
     >>>
 
     output {
-        Array[File] trekker_output_files = glob(
-            "/mnt/disks/cromwell_root/out/*"
-        )
+        Array[File] trekker_output_files = glob("/mnt/disks/cromwell_root/out/**/*")
+    }
+
+    runtime {
+        docker: docker_registry
+        cpu: num_cpu
+        memory: memory
+        bootDiskSizeGB: 25
+        disks: "local-disk ${disk_space} HDD"
+    }
+}
+
+
+task merge_sample_groups {
+    input {
+        File input_samplesheet
+        String output_directory
+        String docker_registry
+        Array[File] run_outputs
+        Int num_cpu
+        String memory
+        Int disk_space
+    }
+
+    command <<<
+        set -euo pipefail
+        ROOT="/mnt/disks/cromwell_root"
+        WORK_DIR="${ROOT}/merge_work"
+        mkdir -p "${WORK_DIR}" "${WORK_DIR}/merged_results"
+        chmod -R 777 "${ROOT}"
+
+        # Read the sheet once and create one localized merge samplesheet per sample_group.
+        # The merger's required columns are sample,out_dir; out_dir points to the full
+        # localized sample output directory, not to individual files.
+        python3 - "~{input_samplesheet}" "${WORK_DIR}/sample_manifest.tsv" <<'PY'
+import csv, sys
+source, destination = sys.argv[1:]
+with open(source, newline='') as f:
+    reader = csv.DictReader(f)
+    if not reader.fieldnames:
+        raise RuntimeError("Samplesheet is empty or has no header")
+    required = ["sample", "sample_group"]
+    missing = [c for c in required if c not in reader.fieldnames]
+    if missing:
+        raise RuntimeError("Samplesheet missing required columns: " + ", ".join(missing))
+    rows = list(reader)
+if not rows:
+    raise RuntimeError("Samplesheet contains no sample rows")
+seen = set()
+with open(destination, "w") as out:
+    for row in rows:
+        sample = (row.get("sample") or "").strip()
+        group = (row.get("sample_group") or "").strip()
+        if not sample or not group:
+            raise RuntimeError("Every row must have non-empty sample and sample_group values")
+        if (sample, group) in seen:
+            raise RuntimeError(f"Duplicate sample/group row: {sample}/{group}")
+        seen.add((sample, group))
+        out.write(sample + "\t" + group + "\n")
+PY
+
+        OUTPUT_BASE="~{output_directory}"
+        OUTPUT_BASE="${OUTPUT_BASE%/}"
+        MANIFEST="${WORK_DIR}/sample_manifest.tsv"
+        MERGE_SCRIPT="/opt/trekker-v1.4.11/trekker_merger.sh"
+
+        if [[ ! -x "${MERGE_SCRIPT}" && ! -f "${MERGE_SCRIPT}" ]]; then
+            echo "ERROR: expected merger script at ${MERGE_SCRIPT}. Ensure it is included in the Docker image." >&2
+            exit 1
+        fi
+
+        # Build a group list, then localize all sample output folders belonging to each group.
+        cut -f2 "${MANIFEST}" | awk '!seen[$0]++' > "${WORK_DIR}/groups.txt"
+        : > "${WORK_DIR}/merge_manifest.txt"
+
+        while IFS= read -r GROUP; do
+            [[ -n "${GROUP}" ]] || continue
+            SAFE_GROUP="$(printf '%s' "${GROUP}" | sed 's/[^a-zA-Z0-9_]/_/g')"
+            GROUP_DIR="${WORK_DIR}/groups/${SAFE_GROUP}"
+            mkdir -p "${GROUP_DIR}/samples" "${GROUP_DIR}/merged_results"
+            MERGE_SAMPLESHEET="${GROUP_DIR}/merge_samplesheet.csv"
+            printf 'sample,out_dir\n' > "${MERGE_SAMPLESHEET}"
+
+            while IFS=$'\t' read -r SAMPLE SAMPLE_GROUP; do
+                [[ "${SAMPLE_GROUP}" == "${GROUP}" ]] || continue
+                CLOUD_SAMPLE_DIR="${OUTPUT_BASE}/${SAMPLE}/outputs"
+                LOCAL_SAMPLE_PARENT="${GROUP_DIR}/samples/${SAMPLE}"
+                LOCAL_SAMPLE_OUT="${LOCAL_SAMPLE_PARENT}/outputs"
+                mkdir -p "${LOCAL_SAMPLE_PARENT}"
+
+                echo "Localizing ${CLOUD_SAMPLE_DIR} to ${LOCAL_SAMPLE_OUT}"
+                gcloud storage cp -r "${CLOUD_SAMPLE_DIR}" "${LOCAL_SAMPLE_PARENT}/"
+
+                if [[ ! -d "${LOCAL_SAMPLE_OUT}" ]]; then
+                    echo "ERROR: expected localized sample output directory ${LOCAL_SAMPLE_OUT}" >&2
+                    find "${LOCAL_SAMPLE_PARENT}" -maxdepth 4 -print
+                    exit 1
+                fi
+                printf '%s,%s\n' "${SAMPLE}" "${LOCAL_SAMPLE_OUT}" >> "${MERGE_SAMPLESHEET}"
+            done < "${MANIFEST}"
+
+            # The merger creates its own output directory; use the requested naming convention.
+            MERGED_NAME="${SAFE_GROUP}_merged"
+            MERGED_LOCAL="${GROUP_DIR}/merged_results/${MERGED_NAME}"
+            mkdir -p "$(dirname "${MERGED_LOCAL}")"
+
+            echo "Merging group '${GROUP}' into ${MERGED_NAME}"
+            bash "${MERGE_SCRIPT}" \
+                "${MERGE_SAMPLESHEET}" \
+                "${MERGED_LOCAL}" \
+                "${MERGED_NAME}" \
+                "conda"
+
+            # Upload the entire merged output directory, preserving nested files.
+            gcloud storage cp -r "${MERGED_LOCAL}" "${OUTPUT_BASE}/"
+            echo "${GROUP}\t${OUTPUT_BASE}/${MERGED_NAME}" >> "${WORK_DIR}/merge_manifest.txt"
+        done < "${WORK_DIR}/groups.txt"
+
+        cp "${WORK_DIR}/merge_manifest.txt" "${WORK_DIR}/merge_manifest.txt.copy"
+        echo "Merge complete. Group output locations:" 
+        cat "${WORK_DIR}/merge_manifest.txt"
+    >>>
+
+    output {
+        File merge_manifest = "/mnt/disks/cromwell_root/merge_work/merge_manifest.txt.copy"
     }
 
     runtime {
