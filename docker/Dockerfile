@@ -68,7 +68,7 @@ RUN chmod +x \
         /opt/trekker_merger-v1.4.11/mergeSeurats.R \
         /opt/trekker_merger-v1.4.11/genreport.R \
         /opt/trekker_merger-v1.4.11/mergeMetrics.py \
-        /opt/trekker_merger-v1.4.11/style.css \
+        /opt/trekker_merger-v1.4.11/style.css 
 
 
 # Remove the temporary GitHub checkout
