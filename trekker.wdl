@@ -61,7 +61,7 @@ workflow trekker_sc {
 
     output {
         Array[File] trekker_outputs = if (existing_trekker_outs) then [] else flatten(select_all(process_sample.trekker_output_files))
-        File? merge_manifest = if (run_trekker_merge) then (if (existing_trekker_outs) then merge_existing.merge_manifest else merge_after_run.merge_manifest) else None
+        Array[File] merge_manifests = select_all([merge_after_run.merge_manifest, merge_existing.merge_manifest])
     }
 }
 
