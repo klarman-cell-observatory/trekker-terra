@@ -32,20 +32,22 @@ workflow trekker_sc {
             }
         }
 
-    if (run_trekker_merge) {
-        call merge_sample_groups as merge_existing {
-            input:
-                input_samplesheet = input_samplesheet,
-                output_directory = output_directory,
-                docker_registry = docker_registry,
-                run_outputs = [],
-                num_cpu = num_cpu,
-                memory = memory,
-                disk_space = disk_space
+        if (run_trekker_merge) {
+            call merge_sample_groups as merge_after_run {
+                input:
+                    input_samplesheet = input_samplesheet,
+                    output_directory = output_directory,
+                    docker_registry = docker_registry,
+                    run_outputs = flatten(select_all(process_sample.trekker_output_files)),
+                    num_cpu = num_cpu,
+                    memory = memory,
+                    disk_space = disk_space
+            }
         }
-        
+    }
+
     if (existing_trekker_outs && run_trekker_merge) {
-        call merge_existing = merge_sample_groups {
+        call merge_sample_groups as merge_existing {
             input:
                 input_samplesheet = input_samplesheet,
                 output_directory = output_directory,
