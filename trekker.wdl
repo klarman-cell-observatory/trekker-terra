@@ -38,7 +38,7 @@ workflow trekker_sc {
                     input_samplesheet = input_samplesheet,
                     output_directory = output_directory,
                     docker_registry = docker_registry,
-                    run_outputs = flatten(select_all(process_sample.trekker_output_files)),
+                    run_outputs = flatten(select_first([process_sample.trekker_output_files, []])),
                     existing_trekker_outs = false,
                     num_cpu = num_cpu,
                     memory = memory,
@@ -62,7 +62,7 @@ workflow trekker_sc {
     }
 
     output {
-        Array[File] trekker_outputs = if (existing_trekker_outs) then [] else flatten(select_all(process_sample.trekker_output_files))
+        Array[File] trekker_outputs = if (existing_trekker_outs) then [] else flatten(select_first([process_sample.trekker_output_files, []]))
     }
 }
 
