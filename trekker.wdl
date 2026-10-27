@@ -98,7 +98,6 @@ with open(sheet, newline='') as f:
     header = reader.fieldnames or []
     if not header:
         raise RuntimeError("Samplesheet is empty or has no header")
-# Parse the individual row using CSV quoting rules, then associate values with the header.
 parsed = next(csv.reader([line]))
 if len(parsed) != len(header):
     raise RuntimeError(f"Samplesheet row has {len(parsed)} columns; expected {len(header)}")
@@ -131,7 +130,7 @@ PY
         echo "Barcode: ${BARCODE_PATH}"
         echo "sc_outdir: ${SC_OUTDIR}"
 
-        # Localize the sample's inputs, following the nuclei_locater localization pattern.
+        # Localize the sample's inputs.
         gcloud storage cp "${FASTQR1_PATH}" "${RAW_DIR}/"
         gcloud storage cp "${FASTQR2_PATH}" "${RAW_DIR}/"
         gcloud storage cp "${BARCODE_PATH}" "${RAW_DIR}/"
@@ -152,7 +151,7 @@ PY
             LOCAL_SC_OUTDIR="${LOCAL_SC_PARENT}/$(basename "${SC_OUTDIR%/}")"
         fi
 
-        # Make a one-sample localized samplesheet and replace cloud paths with local paths.
+        # Write a one-sample samplesheet with localized paths.
         LOCAL_TREKKER_SAMPLESHEET="${RAW_DIR}/trekker_samplesheet.csv"
         python3 - \
             "~{input_samplesheet}" \
@@ -192,7 +191,6 @@ PY
         cat "${LOCAL_TREKKER_SAMPLESHEET}"
         bash /opt/trekker-v1.4.11/nuclei_locater_toplevel.sh "${LOCAL_TREKKER_SAMPLESHEET}"
 
-        # Preserve Trekker's analysis log alongside the sample output.
         ANALYSIS_LOG="${RAW_DIR}/log/${SAMPLE_NAME}/analysis.log"
         if [[ -f "${ANALYSIS_LOG}" ]]; then
             cp "${ANALYSIS_LOG}" "${OUT_DIR}/${SAMPLE_NAME}_analysis.log"
@@ -242,14 +240,14 @@ task merge_sample_groups {
 
     command <<<
         set -euo pipefail
+
         ROOT="/mnt/disks/cromwell_root"
         WORK_DIR="${ROOT}/merge_work"
         mkdir -p "${WORK_DIR}" "${WORK_DIR}/merged_results"
         chmod -R 777 "${ROOT}"
 
-        # Read the sheet once and create one localized merge samplesheet per sample_group.
-        # The documented merger samplesheet columns are sample,out_dir.
-        # out_dir points to the full localized sample output directory, not individual files.
+        # Read the samplesheet and create a manifest of sample/group pairs.
+        # The merger samplesheet header is sample,out_dir.
         python3 - "~{input_samplesheet}" "${WORK_DIR}/sample_manifest.tsv" <<'PY'
 import csv, sys
 source, destination = sys.argv[1:]
@@ -280,64 +278,88 @@ PY
         OUTPUT_BASE="~{output_directory}"
         OUTPUT_BASE="${OUTPUT_BASE%/}"
         MANIFEST="${WORK_DIR}/sample_manifest.tsv"
-        MERGE_SCRIPT="/opt/trekker_merger-v1.4.11/trekker_merger.sh"
+        MERGE_SCRIPT="/opt/trekker-v1.4.11/trekker_merger.sh"
 
         if [[ ! -x "${MERGE_SCRIPT}" && ! -f "${MERGE_SCRIPT}" ]]; then
             echo "ERROR: expected merger script at ${MERGE_SCRIPT}. Ensure it is included in the Docker image." >&2
             exit 1
         fi
 
-        # Build a group list, then localize all sample output folders belonging to each group.
         cut -f2 "${MANIFEST}" | awk '!seen[$0]++' > "${WORK_DIR}/groups.txt"
         : > "${WORK_DIR}/merge_manifest.txt"
 
         while IFS= read -r GROUP; do
             [[ -n "${GROUP}" ]] || continue
+
             SAFE_GROUP="$(printf '%s' "${GROUP}" | sed 's/[^a-zA-Z0-9_]/_/g')"
             GROUP_DIR="${WORK_DIR}/groups/${SAFE_GROUP}"
             mkdir -p "${GROUP_DIR}/samples" "${GROUP_DIR}/merged_results"
+
             MERGE_SAMPLESHEET="${GROUP_DIR}/merge_samplesheet.csv"
             printf 'sample,out_dir\n' > "${MERGE_SAMPLESHEET}"
 
             while IFS=$'\t' read -r SAMPLE SAMPLE_GROUP; do
                 [[ "${SAMPLE_GROUP}" == "${GROUP}" ]] || continue
+
                 LOCAL_SAMPLE_PARENT="${GROUP_DIR}/samples/${SAMPLE}"
                 mkdir -p "${LOCAL_SAMPLE_PARENT}"
 
                 if [[ "~{existing_trekker_outs}" == "true" ]]; then
-                    # Existing cloud layout:
-                    # output_directory/sample_id/*/trekker_sample_id/output/
+                    # Search for one known file, rather than listing the entire
+                    # output directory. Derive the output directory from that file.
                     SAMPLE_ROOT="${OUTPUT_BASE}/${SAMPLE}"
-                    MATCH_LIST="${GROUP_DIR}/${SAMPLE}_output_matches.txt"
-                    gcloud storage ls "${SAMPLE_ROOT}/*/trekker_${SAMPLE}/output/" > "${MATCH_LIST}" || true
+                    MATCH_LIST="${GROUP_DIR}/${SAMPLE}_metrics_matches.txt"
+                    METRICS_NAME="${SAMPLE}_summary_metrics.csv"
+                    RDS_NAME="${SAMPLE}_seurat_spatial.rds"
+
+                    gcloud storage ls \
+                        "${SAMPLE_ROOT}/*/trekker_${SAMPLE}/output/${METRICS_NAME}" \
+                        > "${MATCH_LIST}" || true
+
                     MATCH_COUNT="$(grep -c . "${MATCH_LIST}" || true)"
                     if [[ "${MATCH_COUNT}" -ne 1 ]]; then
-                        echo "ERROR: expected exactly one existing Trekker output for ${SAMPLE}; found ${MATCH_COUNT}." >&2
-                        echo "Search pattern: ${SAMPLE_ROOT}/*/trekker_${SAMPLE}/output/" >&2
+                        echo "ERROR: expected exactly one existing summary metrics file for ${SAMPLE}; found ${MATCH_COUNT}." >&2
+                        echo "Search pattern: ${SAMPLE_ROOT}/*/trekker_${SAMPLE}/output/${METRICS_NAME}" >&2
                         cat "${MATCH_LIST}" >&2 || true
                         exit 1
                     fi
-                    CLOUD_SAMPLE_DIR="$(head -n 1 "${MATCH_LIST}" | sed 's/[[:space:]]*$//')"
+
+                    CLOUD_METRICS_FILE="$(head -n 1 "${MATCH_LIST}" | sed 's/[[:space:]]*$//')"
+                    CLOUD_OUTPUT_DIR="$(dirname "${CLOUD_METRICS_FILE}")"
+                    CLOUD_RDS_FILE="${CLOUD_OUTPUT_DIR}/intermediates/${RDS_NAME}"
+
+                    # Recreate only the directory structure required by the merger.
+                    LOCAL_SAMPLE_OUT="${LOCAL_SAMPLE_PARENT}/output"
+                    mkdir -p "${LOCAL_SAMPLE_OUT}/intermediates"
+
+                    echo "Localizing required merger files for ${SAMPLE} from ${CLOUD_OUTPUT_DIR}"
+                    gcloud storage cp \
+                        "${CLOUD_METRICS_FILE}" \
+                        "${LOCAL_SAMPLE_OUT}/${METRICS_NAME}"
+
+                    gcloud storage cp \
+                        "${CLOUD_RDS_FILE}" \
+                        "${LOCAL_SAMPLE_OUT}/intermediates/${RDS_NAME}"
+
                 else
-                    # Run mode writes each sample's outputs to this location.
+                    # In run mode, use the complete output tree produced by this workflow.
                     CLOUD_SAMPLE_DIR="${OUTPUT_BASE}/${SAMPLE}/outputs/"
+                    LOCAL_SAMPLE_OUT="${LOCAL_SAMPLE_PARENT}/outputs"
+
+                    echo "Localizing ${CLOUD_SAMPLE_DIR} to ${LOCAL_SAMPLE_OUT}"
+                    gcloud storage cp -r "${CLOUD_SAMPLE_DIR}" "${LOCAL_SAMPLE_PARENT}/"
+
+                    if [[ ! -d "${LOCAL_SAMPLE_OUT}" ]]; then
+                        echo "ERROR: expected localized sample output directory ${LOCAL_SAMPLE_OUT}" >&2
+                        find "${LOCAL_SAMPLE_PARENT}" -maxdepth 5 -print
+                        exit 1
+                    fi
                 fi
 
-                LOCAL_DIR_NAME="$(basename "${CLOUD_SAMPLE_DIR%/}")"
-                LOCAL_SAMPLE_OUT="${LOCAL_SAMPLE_PARENT}/${LOCAL_DIR_NAME}"
-                echo "Localizing ${CLOUD_SAMPLE_DIR} to ${LOCAL_SAMPLE_OUT}"
-                gcloud storage cp -r "${CLOUD_SAMPLE_DIR}" "${LOCAL_SAMPLE_PARENT}/"
-
-                # gcloud storage preserves the source directory basename (output or outputs).
-                if [[ ! -d "${LOCAL_SAMPLE_OUT}" ]]; then
-                    echo "ERROR: expected localized sample output directory ${LOCAL_SAMPLE_OUT}" >&2
-                    find "${LOCAL_SAMPLE_PARENT}" -maxdepth 5 -print
-                    exit 1
-                fi
                 printf '%s,%s\n' "${SAMPLE}" "${LOCAL_SAMPLE_OUT}" >> "${MERGE_SAMPLESHEET}"
+
             done < "${MANIFEST}"
 
-            # The merger creates its own output directory; use the requested naming convention.
             MERGED_NAME="${SAFE_GROUP}_merged"
             MERGED_LOCAL="${GROUP_DIR}/merged_results/${MERGED_NAME}"
             mkdir -p "$(dirname "${MERGED_LOCAL}")"
@@ -349,13 +371,13 @@ PY
                 "${MERGED_NAME}" \
                 "conda"
 
-            # Upload the entire merged output directory, preserving nested files.
             gcloud storage cp -r "${MERGED_LOCAL}" "${OUTPUT_BASE}/"
-            echo "${GROUP}\t${OUTPUT_BASE}/${MERGED_NAME}" >> "${WORK_DIR}/merge_manifest.txt"
+            echo "${GROUP}	${OUTPUT_BASE}/${MERGED_NAME}" >> "${WORK_DIR}/merge_manifest.txt"
+
         done < "${WORK_DIR}/groups.txt"
 
         cp "${WORK_DIR}/merge_manifest.txt" "${WORK_DIR}/merge_manifest.txt.copy"
-        echo "Merge complete. Group output locations:" 
+        echo "Merge complete. Group output locations:"
         cat "${WORK_DIR}/merge_manifest.txt"
     >>>
 
