@@ -278,7 +278,7 @@ PY
         OUTPUT_BASE="~{output_directory}"
         OUTPUT_BASE="${OUTPUT_BASE%/}"
         MANIFEST="${WORK_DIR}/sample_manifest.tsv"
-        MERGE_SCRIPT="/opt/trekker-v1.4.11/trekker_merger.sh"
+        MERGE_SCRIPT="/opt/trekker_merger-v1.4.11/trekker_merger.sh"
 
         if [[ ! -x "${MERGE_SCRIPT}" && ! -f "${MERGE_SCRIPT}" ]]; then
             echo "ERROR: expected merger script at ${MERGE_SCRIPT}. Ensure it is included in the Docker image." >&2
