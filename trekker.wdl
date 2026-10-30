@@ -203,7 +203,7 @@ PY
         fi
 
         DESTINATION="~{output_directory}"
-        DESTINATION="${DESTINATION%/}/${SAMPLE_NAME}/outputs"
+        DESTINATION="${DESTINATION%/}/${SAMPLE_NAME}/"
         while IFS= read -r FILE; do
             RELATIVE_PATH="${FILE#${OUT_DIR}/}"
             gcloud storage cp "${FILE}" "${DESTINATION}/${RELATIVE_PATH}"
@@ -343,8 +343,8 @@ PY
 
                 else
                     # In run mode, use the complete output tree produced by this workflow.
-                    CLOUD_SAMPLE_DIR="${OUTPUT_BASE}/${SAMPLE}/outputs/"
-                    LOCAL_SAMPLE_OUT="${LOCAL_SAMPLE_PARENT}/outputs"
+                    CLOUD_SAMPLE_DIR="${OUTPUT_BASE}/${SAMPLE}/"
+                    LOCAL_SAMPLE_OUT="${LOCAL_SAMPLE_PARENT}/"
 
                     echo "Localizing ${CLOUD_SAMPLE_DIR} to ${LOCAL_SAMPLE_OUT}"
                     gcloud storage cp -r "${CLOUD_SAMPLE_DIR}" "${LOCAL_SAMPLE_PARENT}/"
